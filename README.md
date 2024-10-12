@@ -12,6 +12,21 @@ cp .env.example .env
 echo BOT_TOKEN=<bot_token> > .env
 ```
 
+Optionally, you can specify a directory to temporary store downloaded files like so:
+
+```shell
+echo DOWNLOAD_DIR=<download_dir> > .env
+```
+
+Additionally, you can configure the name, the title and the emoji set for the added
+stickers like so:
+
+```shell
+echo STICKER_SET_NAME=<sticker_set_name> > .env
+echo STICKER_SET_TITLE=<sticker_set_title> > .env
+echo EMOJI=<emoji> > .env
+```
+
 Then, run the bot
 
 ```shell
