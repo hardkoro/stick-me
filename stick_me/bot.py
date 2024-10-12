@@ -2,11 +2,10 @@
 
 import io
 import logging
-import os
 import uuid
 
 import httpx
-from telegram import Bot, InputSticker, Sticker, Update, User
+from telegram import Bot, InputSticker, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
@@ -17,212 +16,261 @@ from telegram.ext import (
 )
 from telegram.constants import StickerFormat
 
-from stick_me.exceptions import UnsetEnvironmentError
+from stick_me.constants import (
+    DOWNLOAD_DIR,
+    EMOJI,
+    INVALID_STICKER_SET_PATTERN,
+    STICKER_SET_NAME,
+    STICKER_SET_TITLE,
+)
+from stick_me.models import Conversation, Sticker, User
 
 
 LOGGER = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise UnsetEnvironmentError("BOT_TOKEN environment variable is not set!")
 
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", CURRENT_DIR)
+class StickMeBot:
+    """Telegram bot for managing stickers."""
 
-STICKER_SET_NAME = os.getenv("STICKER_SET_NAME", "favorites_by_st1ck_m3_bot")
-STICKER_SET_TITLE = os.getenv("STICKER_SET_TITLE", "My favorites")
-EMOJI = os.getenv("EMOJI", "❤️")
+    ADD_STICKERS_URL = "https://t.me/addstickers"
 
+    def __init__(
+        self,
+        token: str,
+        async_client: httpx.AsyncClient,
+        download_dir: str = DOWNLOAD_DIR,
+        sticker_set_name: str = STICKER_SET_NAME,
+        sticker_set_title: str = STICKER_SET_TITLE,
+        emoji: str = EMOJI,
+    ) -> None:
+        """Initialize bot."""
+        self._token = token
+        self._client = async_client
 
-def main() -> None:
-    """Main entry point."""
-    LOGGER.info("Starting bot ...")
+        self._download_dir = download_dir
+        self._sticker_set_name = sticker_set_name
+        self._sticker_set_title = sticker_set_title
+        self._emoji = emoji
 
-    try:
-        application = ApplicationBuilder().token(BOT_TOKEN).build()
+    def run(self) -> None:
+        """Main entry point."""
+        LOGGER.info("Starting bot ...")
 
-        sticker_handler = MessageHandler(filters.Sticker.STATIC, handle_sticker)
+        try:
+            application = ApplicationBuilder().token(self._token).build()
 
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(sticker_handler)
+            sticker_handler = MessageHandler(filters.Sticker.STATIC, self.handle_sticker)
 
-        LOGGER.info("Finished starting bot")
+            application.add_handler(CommandHandler("start", self.start))
+            application.add_handler(sticker_handler)
 
-        application.run_polling()
-    finally:
-        LOGGER.info("Stopping bot ...")
-        LOGGER.info("Finished stopping bot")
+            LOGGER.info("Finished starting bot")
+            application.run_polling()
+        finally:
+            LOGGER.info("Stopping bot ...")
+            LOGGER.info("Finished stopping bot")
 
+    async def start(self, update: Update, context: CallbackContext) -> None:
+        """Start the bot."""
+        assert update.effective_user
+        assert update.effective_chat
 
-async def start(update: Update, context: CallbackContext) -> None:
-    """Start the bot."""
-    await notify_user(
-        bot=context.bot,
-        chat_id=update.effective_chat.id,
-        message=(
-            "Hi, I'm a sticker bot!\n"
-            + "Send me a sticker and I'll add it to your sticker set."
-        ),
-    )
+        bot = context.bot
+        user = User(
+            id=update.effective_user.id,
+            name=update.effective_user.name,
+        )
+        conversation = Conversation(
+            user=user,
+            chat_id=update.effective_chat.id,
+        )
 
+        LOGGER.info("Starting conversation with %s ...", conversation.username)
 
-async def notify_user(
-    bot: Bot,
-    chat_id: int,
-    message: str,
-) -> None:
-    """Notify user."""
-    await bot.send_message(chat_id=chat_id, text=message)
+        await self._notify_user(
+            bot=bot,
+            conversation=conversation,
+            message=(
+                "Hi, I'm a sticker bot!\n"
+                + "Send me a sticker and I'll add it to your sticker set."
+            ),
+        )
 
+        LOGGER.info("Finished starting conversation with %s", conversation.username)
 
-async def handle_sticker(update: Update, context: CallbackContext) -> None:
-    """Handle sticker message."""
-    LOGGER.info("Handling sticker from %s ...", update.effective_user.name)
+    async def handle_sticker(self, update: Update, context: CallbackContext) -> None:
+        """Handle sticker message."""
+        assert update.effective_user
+        assert update.effective_chat
+        assert update.message
 
-    bot = context.bot
-    user = update.message.from_user
-    sticker = update.message.sticker
-    chat_id = update.effective_chat.id
+        bot = context.bot
+        user = User(
+            id=update.effective_user.id,
+            name=update.effective_user.name,
+        )
+        conversation = Conversation(
+            user=user,
+            chat_id=update.effective_chat.id,
+        )
 
-    if not sticker:
-        await notify_user(bot, chat_id, "Please send a sticker")
-        LOGGER.warning("Received invalid sticker from %s", user.name)
-        return
+        LOGGER.info("Handling sticker from %s ...", conversation.username)
 
-    await process_sticker(bot, user, chat_id, sticker)
+        if not update.message.sticker:
+            await self._notify_user(
+                bot=bot, conversation=conversation, message="Please send a sticker"
+            )
+            LOGGER.warning("Received invalid sticker from %s", conversation.username)
+            return
 
-    sticker_set_link = f"https://t.me/addstickers/{STICKER_SET_NAME}"
-    await notify_user(
-        bot=bot,
-        chat_id=chat_id,
-        message=f"The link to the sticker set: {sticker_set_link}",
-    )
+        sticker = Sticker(
+            file_id=update.message.sticker.file_id,
+            emoji=update.message.sticker.emoji or self._emoji,
+        )
 
-    LOGGER.info("Finished handling sticker from %s", user.name)
+        await self._process_sticker(bot, conversation, sticker)
 
+        await self._notify_user(
+            bot=bot,
+            conversation=conversation,
+            message=f"The link to the sticker set: {self._get_sticker_set_link()}",
+        )
 
-async def process_sticker(
-    bot: Bot,
-    user: User,
-    chat_id: int,
-    sticker: Sticker,
-) -> None:
-    """Process sticker."""
-    LOGGER.info("Processing sticker %s from %s ...", sticker.file_id, user.name)
+        LOGGER.info("Finished handling sticker from %s", conversation.username)
 
-    sticker_bytes = await download_file(bot, sticker.file_id)
-    await upload_sticker(bot, user, chat_id, sticker_bytes, sticker.emoji)
+    @staticmethod
+    async def _notify_user(
+        bot: Bot,
+        conversation: Conversation,
+        message: str,
+    ) -> None:
+        """Notify user."""
+        await bot.send_message(chat_id=conversation.chat_id, text=message)
 
-    LOGGER.info("Finished processing sticker %s from %s", sticker.file_id, user.name)
+    def _get_sticker_set_link(self) -> str:
+        """Get sticker set link."""
+        return f"{self.ADD_STICKERS_URL}/{self._sticker_set_name}"
 
+    async def _process_sticker(
+        self,
+        bot: Bot,
+        conversation: Conversation,
+        sticker: Sticker,
+    ) -> None:
+        """Process sticker."""
+        LOGGER.info("Processing sticker %s from %s ...", sticker.file_id, conversation.username)
 
-async def download_file(bot: Bot, file_id: str) -> bytes:
-    """Download sticker file."""
-    LOGGER.info("Downloading sticker %s ...", file_id)
+        sticker.content = await self._download_file(bot, sticker)
+        await self._upload_sticker(bot, conversation, sticker)
 
-    file = await bot.get_file(file_id)
-    file_url = file.file_path or ""
+        LOGGER.info(
+            "Finished processing sticker %s from %s", sticker.file_id, conversation.username
+        )
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(file_url)
-        response.raise_for_status()
-        sticker_bytes = response.content
+    async def _download_file(self, bot: Bot, sticker: Sticker) -> bytes:
+        """Download sticker file."""
+        LOGGER.info("Downloading sticker %s ...", sticker.file_id)
 
-    LOGGER.info("Finished downloading sticker %s", file_id)
+        file = await bot.get_file(sticker.file_id)
+        file_url = file.file_path or ""
 
-    return sticker_bytes
+        async with self._client as client:
+            response = await client.get(file_url)
+            response.raise_for_status()
+            sticker_bytes = response.content
 
+        LOGGER.info("Finished downloading sticker %s", sticker.file_id)
 
-async def upload_sticker(
-    bot: Bot,
-    user: User,
-    chat_id: int,
-    sticker_bytes: bytes,
-    sticker_emoji: str = EMOJI,
-) -> None:
-    """Upload sticker to user."""
-    LOGGER.info("Uploading sticker to %s ...", user.name)
+        return sticker_bytes
 
-    sticker_file = io.BytesIO(sticker_bytes)
-    sticker_file.name = f"{uuid.uuid4()}_sticker.png"
+    async def _upload_sticker(
+        self,
+        bot: Bot,
+        conversation: Conversation,
+        sticker: Sticker,
+    ) -> None:
+        """Upload sticker to user."""
+        LOGGER.info("Uploading sticker to %s ...", conversation.username)
 
-    response = await bot.upload_sticker_file(
-        user.id,
-        sticker_file,
-        sticker_format=StickerFormat.STATIC,
-    )
-    uploaded_file_id = response.file_id
+        assert sticker.content
+        sticker_file = io.BytesIO(sticker.content)
+        sticker_file.name = f"{uuid.uuid4()}_sticker.png"
 
-    sticker = InputSticker(
-        sticker=uploaded_file_id,
-        emoji_list=[sticker_emoji],
-        format=StickerFormat.STATIC,
-    )
+        response = await bot.upload_sticker_file(
+            conversation.user_id,
+            sticker_file,
+            sticker_format=StickerFormat.STATIC,
+        )
+        uploaded_file_id = response.file_id
 
-    try:
-        if await bot.add_sticker_to_set(
-            user_id=user.id,
+        input_sticker = InputSticker(
+            sticker=uploaded_file_id,
+            emoji_list=[sticker.emoji],
+            format=StickerFormat.STATIC,
+        )
+
+        try:
+            if await bot.add_sticker_to_set(
+                user_id=conversation.user_id,
+                name=STICKER_SET_NAME,
+                sticker=input_sticker,
+            ):
+                await self._notify_user(
+                    bot=bot,
+                    conversation=conversation,
+                    message=(
+                        "Sticker added to your set!\n"
+                        + "It might take up to a couple of minutes to appear."
+                    ),
+                )
+                LOGGER.info("Added sticker to %s", conversation.username)
+            else:
+                await self._notify_user(
+                    bot=bot,
+                    conversation=conversation,
+                    message="Failed to add sticker to your set!",
+                )
+                LOGGER.error("Failed to add sticker to %s", conversation.username)
+        except TelegramError as exc:
+            if INVALID_STICKER_SET_PATTERN in str(exc):
+                await self._create_sticker_set(
+                    bot=bot,
+                    conversation=conversation,
+                    sticker=input_sticker,
+                )
+            else:
+                await self._notify_user(
+                    bot=bot,
+                    conversation=conversation,
+                    message="Failed to add sticker to your set!",
+                )
+                LOGGER.error("Failed to upload sticker to %s: %s", conversation.username, exc)
+
+        LOGGER.info("Finished uploading sticker to %s", conversation.username)
+
+    async def _create_sticker_set(
+        self,
+        bot: Bot,
+        conversation: Conversation,
+        sticker: InputSticker,
+    ) -> None:
+        """Create sticker set."""
+        LOGGER.info("Creating sticker set for %s ...", conversation.username)
+
+        await bot.create_new_sticker_set(
+            user_id=conversation.user_id,
             name=STICKER_SET_NAME,
-            sticker=sticker,
-        ):
-            await notify_user(
-                bot=bot,
-                chat_id=chat_id,
-                message=(
-                    "Sticker added to your set!\n"
-                    + "It might take up to a couple of minutes to appear."
-                ),
-            )
-            LOGGER.info("Added sticker to %s", user.name)
-        else:
-            await notify_user(
-                bot=bot,
-                chat_id=chat_id,
-                message="Failed to add sticker to your set!",
-            )
-            LOGGER.error("Failed to add sticker to %s", user.name)
-    except TelegramError as exc:
-        if "Stickerset_invalid" in str(exc):
-            await create_sticker_set(
-                bot=bot,
-                user=user,
-                chat_id=chat_id,
-                sticker=sticker,
-            )
-        else:
-            await notify_user(
-                bot=bot,
-                chat_id=chat_id,
-                message="Failed to add sticker to your set!",
-            )
-            LOGGER.error("Failed to upload sticker to %s: %s", user.name, exc)
+            title=STICKER_SET_TITLE,
+            stickers=[sticker],
+        )
 
-    LOGGER.info("Finished uploading sticker to %s", user.name)
+        await self._notify_user(
+            bot=bot,
+            conversation=conversation,
+            message=(
+                "Sticker set created and the sticker added to your set!\n"
+                + "It might take up to a couple of minutes to appear."
+            ),
+        )
 
-
-async def create_sticker_set(
-    bot: Bot,
-    user: User,
-    chat_id: int,
-    sticker: InputSticker,
-) -> None:
-    """Create sticker set."""
-    LOGGER.info("Creating sticker set for %s ...", user.name)
-
-    await bot.create_new_sticker_set(
-        user_id=user.id,
-        name=STICKER_SET_NAME,
-        title=STICKER_SET_TITLE,
-        stickers=[sticker],
-    )
-
-    await notify_user(
-        bot=bot,
-        chat_id=chat_id,
-        message=(
-            "Sticker set created and the sticker added to your set!\n"
-            + "It might take up to a couple of minutes to appear."
-        ),
-    )
-
-    LOGGER.info("Finished creating sticker set for %s", user.name)
+        LOGGER.info("Finished creating sticker set for %s", conversation.username)
