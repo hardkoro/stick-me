@@ -1,6 +1,6 @@
 # Stick Me
 
-A Telegram bot which helps to create a sticker set with your beloved stickers.
+Telegram bot to create a sticker set with your beloved stickers.
 
 ## Run the script
 
